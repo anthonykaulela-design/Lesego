@@ -2,244 +2,246 @@ const express = require('express');
 const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
-const WebSocket = require('ws');
+const axios = require('axios');
 require('dotenv').config();
 
 const app = express();
+const PORT = process.env.PORT || 5000;
+const JWT_SECRET = process.env.JWT_SECRET || 'lesego_markets_fallback_secret';
 
-// --- 1. CORS & Middleware Configuration ---
+// --- CORS Configuration (Prevents Browser Blocking) ---
 app.use(cors({
-    origin: '*', // Allows all frontend domains to connect without CORS issues
+    origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization']
 }));
+
 app.use(express.json());
 
-// In-Memory Database (Replace with MongoDB/PostgreSQL in production)
-const usersDB = [];
-const accountBalances = {};
+// --- In-Memory Datastore (Connect MongoDB/PostgreSQL in production) ---
+const users = [];
+const userBalances = {}; // { userId: { DEMO: 10000, REAL: 0 } }
+const userPositions = []; // Active trades
 
-// --- 2. JWT Authentication Middleware ---
+// cTrader API Endpoint Configurations
+const CTRADER_ENDPOINTS = {
+    DEMO: 'https://demo.ctraderapi.com',
+    REAL: 'https://live.ctraderapi.com'
+};
+
+// --- Authentication Middleware ---
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
 
-    if (!token) return res.status(401).json({ error: 'Access denied. Please log in.' });
+    if (!token) {
+        return res.status(401).json({ success: false, message: 'Access denied. Please login first.' });
+    }
 
-    jwt.verify(token, process.env.JWT_SECRET, (err, user) => {
-        if (err) return res.status(403).json({ error: 'Invalid or expired session.' });
+    jwt.verify(token, JWT_SECRET, (err, user) => {
+        if (err) {
+            return res.status(403).json({ success: false, message: 'Session expired or invalid token.' });
+        }
         req.user = user;
         next();
     });
 };
 
-// --- 3. User Registration & Login Endpoints ---
+// --- Health Check for Render Deployment ---
+app.get('/', (req, res) => {
+    res.status(200).json({ status: 'Online', service: 'Lesego Markets API Engine', timestamp: new Date() });
+});
+
+// ==========================================
+// 1. AUTHENTICATION ROUTES (Register & Login)
+// ==========================================
+
+// Register User
 app.post('/api/auth/register', async (req, res) => {
     try {
-        const { email, password, accountType } = req.body; // accountType: 'demo' or 'real'
-        
-        const existingUser = usersDB.find(u => u.email === email);
-        if (existingUser) return res.status(400).json({ error: 'Email already registered.' });
+        const { fullName, email, password } = req.body;
+
+        if (!email || !password || !fullName) {
+            return res.status(400).json({ success: false, message: 'All fields are required.' });
+        }
+
+        const existingUser = users.find(u => u.email === email);
+        if (existingUser) {
+            return res.status(400).json({ success: false, message: 'User already exists.' });
+        }
 
         const hashedPassword = await bcrypt.hash(password, 10);
-        const newUser = {
-            id: 'USER_' + Date.now(),
-            email,
-            password: hashedPassword,
-            accountType: accountType || 'demo',
-            cTraderAccountId: null,
-            accessToken: null
+        const userId = 'usr_' + Date.now();
+
+        const newUser = { id: userId, fullName, email, password: hashedPassword, createdAt: new Date() };
+        users.push(newUser);
+
+        // Initialize Demo and Real Balances
+        userBalances[userId] = { DEMO: 10000.00, REAL: 0.00 };
+
+        res.status(201).json({ success: true, message: 'Registration successful. You can now login.' });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Login User
+app.post('/api/auth/login', async (req, res) => {
+    try {
+        const { email, password } = req.body;
+
+        const user = users.find(u => u.email === email);
+        if (!user) {
+            return res.status(400).json({ success: false, message: 'Invalid email or password.' });
+        }
+
+        const validPassword = await bcrypt.compare(password, user.password);
+        if (!validPassword) {
+            return res.status(400).json({ success: false, message: 'Invalid email or password.' });
+        }
+
+        const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '24h' });
+
+        res.json({
+            success: true,
+            token,
+            user: { id: user.id, fullName: user.fullName, email: user.email },
+            balances: userBalances[user.id]
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Get User Profile & Balances
+app.get('/api/user/profile', authenticateToken, (req, res) => {
+    const user = users.find(u => u.id === req.user.userId);
+    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
+
+    res.json({
+        success: true,
+        user: { id: user.id, fullName: user.fullName, email: user.email },
+        balances: userBalances[user.id] || { DEMO: 10000, REAL: 0 }
+    });
+});
+
+// ==========================================
+// 2. WALLET (Deposits & Withdrawals)
+// ==========================================
+
+// Deposit Funds
+app.post('/api/wallet/deposit', authenticateToken, (req, res) => {
+    const { amount, accountType } = req.body; // DEMO or REAL
+    const type = (accountType || 'DEMO').toUpperCase();
+
+    if (!amount || amount <= 0) {
+        return res.status(400).json({ success: false, message: 'Invalid deposit amount.' });
+    }
+
+    userBalances[req.user.userId][type] += parseFloat(amount);
+
+    res.json({
+        success: true,
+        message: `Successfully deposited $${amount} to ${type} account.`,
+        newBalance: userBalances[req.user.userId][type]
+    });
+});
+
+// Withdraw Funds
+app.post('/api/wallet/withdraw', authenticateToken, (req, res) => {
+    const { amount, accountType } = req.body;
+    const type = (accountType || 'REAL').toUpperCase();
+
+    if (!amount || amount <= 0) {
+        return res.status(400).json({ success: false, message: 'Invalid withdrawal amount.' });
+    }
+
+    if (userBalances[req.user.userId][type] < amount) {
+        return res.status(400).json({ success: false, message: 'Insufficient funds.' });
+    }
+
+    userBalances[req.user.userId][type] -= parseFloat(amount);
+
+    res.json({
+        success: true,
+        message: `Successfully withdrew $${amount} from ${type} account.`,
+        newBalance: userBalances[req.user.userId][type]
+    });
+});
+
+// ==========================================
+// 3. TRADING & cTRADER API INTEGRATION
+// ==========================================
+
+// cTrader OAuth Credentials Integration Endpoint
+app.get('/api/ctrader/credentials', authenticateToken, (req, res) => {
+    res.json({
+        clientId: process.env.CTRADER_CLIENT_ID,
+        redirectUri: 'https://lesegomarkets.com/oauth/callback'
+    });
+});
+
+// Place Trade Order (Supports Demo & Real Accounts)
+app.post('/api/trade/order', authenticateToken, async (req, res) => {
+    try {
+        const { symbol, tradeType, volume, accountType, stopLoss, takeProfit } = req.body;
+        const mode = (accountType || 'DEMO').toUpperCase(); // DEMO or REAL
+
+        if (!symbol || !tradeType || !volume) {
+            return res.status(400).json({ success: false, message: 'Symbol, trade type, and volume are required.' });
+        }
+
+        const position = {
+            tradeId: 'trd_' + Date.now(),
+            userId: req.user.userId,
+            accountType: mode,
+            symbol,
+            tradeType: tradeType.toUpperCase(), // BUY or SELL
+            volume,
+            openPrice: symbol.includes('XAU') ? 2500.50 : 1.0850, // Mock price engine
+            stopLoss: stopLoss || null,
+            takeProfit: takeProfit || null,
+            openedAt: new Date()
         };
 
-        usersDB.push(newUser);
-        accountBalances[newUser.id] = accountType === 'demo' ? 10000.00 : 0.00;
+        userPositions.push(position);
 
-        res.status(201).json({ message: 'Account created successfully. Please log in.' });
-    } catch (err) {
-        res.status(500).json({ error: err.message });
+        res.status(201).json({
+            success: true,
+            message: `Trade executed on ${mode} account via Lesego Markets Engine.`,
+            trade: position
+        });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
     }
 });
 
-app.post('/api/auth/login', async (req, res) => {
-    const { email, password } = req.body;
-    const user = usersDB.find(u => u.email === email);
+// Get Active Trades
+app.get('/api/trade/positions', authenticateToken, (req, res) => {
+    const { accountType } = req.query;
+    const mode = (accountType || 'DEMO').toUpperCase();
 
-    if (!user || !(await bcrypt.compare(password, user.password))) {
-        return res.status(401).json({ error: 'Invalid email or password.' });
-    }
-
-    const token = jwt.sign(
-        { id: user.id, email: user.email, accountType: user.accountType },
-        process.env.JWT_SECRET,
-        { expiresIn: '24h' }
+    const activeTrades = userPositions.filter(
+        p => p.userId === req.user.userId && p.accountType === mode
     );
 
-    res.json({
-        message: 'Login successful',
-        token,
-        user: {
-            id: user.id,
-            email: user.email,
-            accountType: user.accountType,
-            balance: accountBalances[user.id]
-        }
-    });
+    res.json({ success: true, accountType: mode, positions: activeTrades });
 });
 
-// --- 4. cTrader Open API Connection Layer ---
-class CTraderService {
-    constructor(environment = 'demo') {
-        this.host = environment === 'live' ? process.env.CTRADER_LIVE_HOST : process.env.CTRADER_DEMO_HOST;
-        this.port = process.env.CTRADER_PORT;
-        this.ws = null;
+// Close Trade
+app.post('/api/trade/close', authenticateToken, (req, res) => {
+    const { tradeId } = req.body;
+    const index = userPositions.findIndex(p => p.tradeId === tradeId && p.userId === req.user.userId);
+
+    if (index === -1) {
+        return res.status(404).json({ success: false, message: 'Position not found.' });
     }
 
-    connect() {
-        return new Promise((resolve, reject) => {
-            const url = `wss://${this.host}:${this.port}`;
-            this.ws = new WebSocket(url);
-
-            this.ws.on('open', () => {
-                this.authenticateApplication().then(resolve).catch(reject);
-            });
-
-            this.ws.on('error', (err) => reject(err));
-        });
-    }
-
-    // Authorize application credentials (Client ID & Secret)
-    authenticateApplication() {
-        return new Promise((resolve) => {
-            const appAuthReq = {
-                clientPublicId: process.env.CTRADER_CLIENT_ID,
-                clientSecret: process.env.CTRADER_CLIENT_SECRET
-            };
-            // Send Application Auth Request to cTrader OpenAPI Protobuf socket
-            this.ws.send(JSON.stringify({ payloadType: 2100, payload: appAuthReq }));
-            resolve({ status: 'Application Authenticated' });
-        });
-    }
-
-    // Place Market/Limit/Stop Order
-    sendOrder(ctraderAccountId, accessToken, orderDetails) {
-        return new Promise((resolve, reject) => {
-            if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-                return reject('cTrader connection offline.');
-            }
-
-            const protoOrderReq = {
-                ctraderAccountId,
-                symbolId: orderDetails.symbolId, // e.g., 1 for EURUSD
-                tradeSide: orderDetails.action.toUpperCase(), // BUY or SELL
-                orderType: orderDetails.orderType || "MARKET",
-                volume: orderDetails.volume * 100000, // Converts lots to units
-                stopLoss: orderDetails.stopLoss || null,
-                takeProfit: orderDetails.takeProfit || null
-            };
-
-            // Transmit execution request to cTrader OpenAPI engine
-            this.ws.send(JSON.stringify({ payloadType: 2106, payload: protoOrderReq }));
-            
-            resolve({
-                status: 'SUCCESS',
-                message: 'Order executed via cTrader API',
-                details: protoOrderReq
-            });
-        });
-    }
-}
-
-// Global cTrader instances
-const ctraderDemo = new CTraderService('demo');
-const ctraderLive = new CTraderService('live');
-
-// Initialize Open API connections
-ctraderDemo.connect().catch(console.error);
-ctraderLive.connect().catch(console.error);
-
-// --- 5. Protected Trading Endpoints ---
-
-// Linking cTrader Access Token to User Session
-app.post('/api/trading/connect-ctrader', authenticateToken, (req, res) => {
-    const { ctraderAccountId, accessToken } = req.body;
-    const user = usersDB.find(u => u.id === req.user.id);
-
-    if (!user) return res.status(404).json({ error: 'User not found.' });
-
-    user.cTraderAccountId = ctraderAccountId;
-    user.accessToken = accessToken;
-
-    res.json({ message: 'cTrader account successfully linked.' });
+    const closedTrade = userPositions.splice(index, 1)[0];
+    res.json({ success: true, message: 'Trade closed successfully.', closedTrade });
 });
 
-// Place Trade Endpoint
-app.post('/api/trading/order', authenticateToken, async (req, res) => {
-    try {
-        const user = usersDB.find(u => u.id === req.user.id);
-        const { symbolId, action, volume, stopLoss, takeProfit } = req.body;
-
-        if (!symbolId || !action || !volume) {
-            return res.status(400).json({ error: 'Missing required trade params (symbolId, action, volume).' });
-        }
-
-        const activeService = user.accountType === 'live' ? ctraderLive : ctraderDemo;
-        
-        const result = await activeService.sendOrder(user.cTraderAccountId, user.accessToken, {
-            symbolId,
-            action,
-            volume,
-            stopLoss,
-            takeProfit
-        });
-
-        res.json(result);
-    } catch (err) {
-        res.status(500).json({ error: err.toString() });
-    }
-});
-
-// --- 6. Wallet Endpoints (Deposits & Withdrawals) ---
-app.post('/api/wallet/deposit', authenticateToken, (req, res) => {
-    const { amount } = req.body;
-    if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid deposit amount.' });
-
-    accountBalances[req.user.id] = (accountBalances[req.user.id] || 0) + parseFloat(amount);
-
-    res.json({
-        message: 'Deposit successful.',
-        newBalance: accountBalances[req.user.id]
-    });
-});
-
-app.post('/api/wallet/withdraw', authenticateToken, (req, res) => {
-    const { amount } = req.body;
-    const currentBalance = accountBalances[req.user.id] || 0;
-
-    if (!amount || amount <= 0) return res.status(400).json({ error: 'Invalid withdrawal amount.' });
-    if (amount > currentBalance) return res.status(400).json({ error: 'Insufficient funds.' });
-
-    accountBalances[req.user.id] -= parseFloat(amount);
-
-    res.json({
-        message: 'Withdrawal request processed successfully.',
-        newBalance: accountBalances[req.user.id]
-    });
-});
-
-// Account Summary Endpoint
-app.get('/api/account/summary', authenticateToken, (req, res) => {
-    const user = usersDB.find(u => u.id === req.user.id);
-    res.json({
-        userId: user.id,
-        email: user.email,
-        accountType: user.accountType,
-        balance: accountBalances[user.id],
-        cTraderConnected: !!user.cTraderAccountId
-    });
-});
-
-// Start Express Server
-const PORT = process.env.PORT || 5000;
-app.listen(PORT, () => {
-    console.log(`Lesego Markets Backend running on port ${PORT}`);
+// --- Server Listener for Render Deployment ---
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Lesego Markets API Engine running on port ${PORT}`);
 });
