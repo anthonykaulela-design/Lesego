@@ -1,12 +1,13 @@
 {
-  "name": "lesego-markets-ctrader-server",
-  "version": "1.0.0",
-  "description": "Lesego Markets cTrader Open API Gateway Engine",
+  "name": "lesego-markets-ctrader-backend",
+  "version": "2.1.0",
+  "description": "Lesego Markets cTrader Open API Production Engine",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
+    "@spotware/open-api-sdk": "^2.3.0",
     "axios": "^1.6.8",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
