@@ -1,247 +1,567 @@
+/**
+ * Lesego Markets - cTrader Open API Production Gateway
+ * Standard: Open API v2 Protocol (WebSocket + OAuth 2.0)
+ */
+
 const express = require('express');
 const cors = require('cors');
-const jwt = require('jsonwebtoken');
-const bcrypt = require('bcryptjs');
 const axios = require('axios');
+const WebSocket = require('ws');
+const http = require('http');
 require('dotenv').config();
 
-const app = express();
-const PORT = process.env.PORT || 5000;
-const JWT_SECRET = process.env.JWT_SECRET || 'lesego_markets_fallback_secret';
+// ==========================================
+// 1. GLOBAL CONFIGURATION & CONSTANTS
+// ==========================================
+const PORT = process.env.PORT || 10000;
+const CTRADER_CLIENT_ID = process.env.CTRADER_CLIENT_ID || "38384_wh6ecCD5h0tHjsNXc57f7a0f2aZeKUubeFlpkKDMpQqHn58H0m";
+const CTRADER_CLIENT_SECRET = process.env.CTRADER_CLIENT_SECRET || "jkcXDForVeNulNasjMa1vnQKtZwbrOLjgH4GDLL3dkVWZVC0V4";
+const CTRADER_REDIRECT_URI = process.env.CTRADER_REDIRECT_URI || "https://lesegomarkets.com/oauth/callback";
 
-// --- CORS Configuration (Prevents Browser Blocking) ---
+// cTrader Open API WebSocket Endpoints (Port 5035 for WebSockets)
+const CTRADER_HOSTS = {
+    DEMO: 'wss://demo.ctraderapi.com:5035',
+    LIVE: 'wss://live.ctraderapi.com:5035'
+};
+
+// cTrader Open API ProtoPayloadType Identifiers
+const PROTO_PAYLOAD_TYPE = {
+    HEARTBEAT_EVENT: 51,
+    PROTO_OA_APPLICATION_AUTH_REQ: 2100,
+    PROTO_OA_APPLICATION_AUTH_RES: 2101,
+    PROTO_OA_ACCOUNT_AUTH_REQ: 2102,
+    PROTO_OA_ACCOUNT_AUTH_RES: 2103,
+    PROTO_OA_NEW_ORDER_REQ: 2106,
+    PROTO_OA_CLOSE_POSITION_REQ: 2107,
+    PROTO_OA_CANCEL_ORDER_REQ: 2108,
+    PROTO_OA_AMEND_POSITION_SLTP_REQ: 2109,
+    PROTO_OA_SYMBOLS_LIST_REQ: 2114,
+    PROTO_OA_SYMBOLS_LIST_RES: 2115,
+    PROTO_OA_TRADER_REQ: 2121,
+    PROTO_OA_TRADER_RES: 2122,
+    PROTO_OA_RECONCILE_REQ: 2124,
+    PROTO_OA_RECONCILE_RES: 2125,
+    PROTO_OA_EXECUTION_EVENT: 2126,
+    PROTO_OA_SUBSCRIBE_SPOTS_REQ: 2135,
+    PROTO_OA_SPOT_EVENT: 2136,
+    PROTO_OA_ERROR_RES: 2142,
+    PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ: 2149,
+    PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_RES: 2150,
+    PROTO_OA_DEPOSIT_MARGIN_REQ: 2154,
+    PROTO_OA_WITHDRAW_MARGIN_REQ: 2155
+};
+
+// ==========================================
+// 2. EXPRESS APP & SERVER INITIALIZATION
+// ==========================================
+const app = express();
+const server = http.createServer(app);
+
+// CORS Policy Configuration (Prevents Browser Blocking)
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With']
 }));
 
 app.use(express.json());
 
-// --- In-Memory Datastore (Connect MongoDB/PostgreSQL in production) ---
-const users = [];
-const userBalances = {}; // { userId: { DEMO: 10000, REAL: 0 } }
-const userPositions = []; // Active trades
+// Frontend WebSocket Server for broadcasting live ticks and events to web client
+const wssFrontend = new WebSocket.Server({ noServer: true });
 
-// cTrader API Endpoint Configurations
-const CTRADER_ENDPOINTS = {
-    DEMO: 'https://demo.ctraderapi.com',
-    REAL: 'https://live.ctraderapi.com'
-};
-
-// --- Authentication Middleware ---
-const authenticateToken = (req, res, next) => {
-    const authHeader = req.headers['authorization'];
-    const token = authHeader && authHeader.split(' ')[1];
-
-    if (!token) {
-        return res.status(401).json({ success: false, message: 'Access denied. Please login first.' });
-    }
-
-    jwt.verify(token, JWT_SECRET, (err, user) => {
-        if (err) {
-            return res.status(403).json({ success: false, message: 'Session expired or invalid token.' });
-        }
-        req.user = user;
-        next();
+server.on('upgrade', (request, socket, head) => {
+    wssFrontend.handleUpgrade(request, socket, head, (ws) => {
+        wssFrontend.emit('connection', ws, request);
     });
+});
+
+// Active Active cTrader Connection Pool
+const socketPool = {
+    DEMO: null,
+    LIVE: null
 };
 
-// --- Health Check for Render Deployment ---
-app.get('/', (req, res) => {
-    res.status(200).json({ status: 'Online', service: 'Lesego Markets API Engine', timestamp: new Date() });
-});
+const clientSessions = new Map(); // Store user access tokens & connected accounts
 
 // ==========================================
-// 1. AUTHENTICATION ROUTES (Register & Login)
+// 3. CTRADER WEBSOCKET CLIENT MANAGER
 // ==========================================
-
-// Register User
-app.post('/api/auth/register', async (req, res) => {
-    try {
-        const { fullName, email, password } = req.body;
-
-        if (!email || !password || !fullName) {
-            return res.status(400).json({ success: false, message: 'All fields are required.' });
-        }
-
-        const existingUser = users.find(u => u.email === email);
-        if (existingUser) {
-            return res.status(400).json({ success: false, message: 'User already exists.' });
-        }
-
-        const hashedPassword = await bcrypt.hash(password, 10);
-        const userId = 'usr_' + Date.now();
-
-        const newUser = { id: userId, fullName, email, password: hashedPassword, createdAt: new Date() };
-        users.push(newUser);
-
-        // Initialize Demo and Real Balances
-        userBalances[userId] = { DEMO: 10000.00, REAL: 0.00 };
-
-        res.status(201).json({ success: true, message: 'Registration successful. You can now login.' });
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
+class CTraderConnectionManager {
+    constructor(environment = 'DEMO') {
+        this.environment = environment;
+        this.url = CTRADER_HOSTS[environment];
+        this.ws = null;
+        this.isAuthorized = false;
+        this.pendingRequests = new Map();
+        this.pingInterval = null;
     }
-});
 
-// Login User
-app.post('/api/auth/login', async (req, res) => {
-    try {
-        const { email, password } = req.body;
+    connect() {
+        return new Promise((resolve, reject) => {
+            console.log(`[cTrader Gateway] Connecting to ${this.environment} at ${this.url}...`);
+            this.ws = new WebSocket(this.url);
 
-        const user = users.find(u => u.email === email);
-        if (!user) {
-            return res.status(400).json({ success: false, message: 'Invalid email or password.' });
-        }
+            this.ws.on('open', () => {
+                console.log(`[cTrader Gateway] Connected to ${this.environment} WebSocket.`);
+                this.startHeartbeat();
+                this.authorizeApplication()
+                    .then(() => {
+                        this.isAuthorized = true;
+                        resolve(true);
+                    })
+                    .catch(reject);
+            });
 
-        const validPassword = await bcrypt.compare(password, user.password);
-        if (!validPassword) {
-            return res.status(400).json({ success: false, message: 'Invalid email or password.' });
-        }
+            this.ws.on('message', (data) => {
+                this.handleIncomingMessage(data);
+            });
 
-        const token = jwt.sign({ userId: user.id, email: user.email }, JWT_SECRET, { expiresIn: '24h' });
+            this.ws.on('error', (err) => {
+                console.error(`[cTrader Gateway] WebSocket Error (${this.environment}):`, err.message);
+            });
 
-        res.json({
-            success: true,
-            token,
-            user: { id: user.id, fullName: user.fullName, email: user.email },
-            balances: userBalances[user.id]
+            this.ws.on('close', () => {
+                console.warn(`[cTrader Gateway] Connection lost to ${this.environment}. Reconnecting in 5s...`);
+                this.isAuthorized = false;
+                this.stopHeartbeat();
+                setTimeout(() => this.connect(), 5000);
+            });
         });
-    } catch (error) {
-        res.status(500).json({ success: false, message: error.message });
-    }
-});
-
-// Get User Profile & Balances
-app.get('/api/user/profile', authenticateToken, (req, res) => {
-    const user = users.find(u => u.id === req.user.userId);
-    if (!user) return res.status(404).json({ success: false, message: 'User not found.' });
-
-    res.json({
-        success: true,
-        user: { id: user.id, fullName: user.fullName, email: user.email },
-        balances: userBalances[user.id] || { DEMO: 10000, REAL: 0 }
-    });
-});
-
-// ==========================================
-// 2. WALLET (Deposits & Withdrawals)
-// ==========================================
-
-// Deposit Funds
-app.post('/api/wallet/deposit', authenticateToken, (req, res) => {
-    const { amount, accountType } = req.body; // DEMO or REAL
-    const type = (accountType || 'DEMO').toUpperCase();
-
-    if (!amount || amount <= 0) {
-        return res.status(400).json({ success: false, message: 'Invalid deposit amount.' });
     }
 
-    userBalances[req.user.userId][type] += parseFloat(amount);
-
-    res.json({
-        success: true,
-        message: `Successfully deposited $${amount} to ${type} account.`,
-        newBalance: userBalances[req.user.userId][type]
-    });
-});
-
-// Withdraw Funds
-app.post('/api/wallet/withdraw', authenticateToken, (req, res) => {
-    const { amount, accountType } = req.body;
-    const type = (accountType || 'REAL').toUpperCase();
-
-    if (!amount || amount <= 0) {
-        return res.status(400).json({ success: false, message: 'Invalid withdrawal amount.' });
+    startHeartbeat() {
+        this.pingInterval = setInterval(() => {
+            if (this.ws && this.ws.readyState === WebSocket.OPEN) {
+                this.sendPayload(PROTO_PAYLOAD_TYPE.HEARTBEAT_EVENT, {});
+            }
+        }, 10000);
     }
 
-    if (userBalances[req.user.userId][type] < amount) {
-        return res.status(400).json({ success: false, message: 'Insufficient funds.' });
+    stopHeartbeat() {
+        if (this.pingInterval) clearInterval(this.pingInterval);
     }
 
-    userBalances[req.user.userId][type] -= parseFloat(amount);
-
-    res.json({
-        success: true,
-        message: `Successfully withdrew $${amount} from ${type} account.`,
-        newBalance: userBalances[req.user.userId][type]
-    });
-});
-
-// ==========================================
-// 3. TRADING & cTRADER API INTEGRATION
-// ==========================================
-
-// cTrader OAuth Credentials Integration Endpoint
-app.get('/api/ctrader/credentials', authenticateToken, (req, res) => {
-    res.json({
-        clientId: process.env.CTRADER_CLIENT_ID,
-        redirectUri: 'https://lesegomarkets.com/oauth/callback'
-    });
-});
-
-// Place Trade Order (Supports Demo & Real Accounts)
-app.post('/api/trade/order', authenticateToken, async (req, res) => {
-    try {
-        const { symbol, tradeType, volume, accountType, stopLoss, takeProfit } = req.body;
-        const mode = (accountType || 'DEMO').toUpperCase(); // DEMO or REAL
-
-        if (!symbol || !tradeType || !volume) {
-            return res.status(400).json({ success: false, message: 'Symbol, trade type, and volume are required.' });
-        }
-
-        const position = {
-            tradeId: 'trd_' + Date.now(),
-            userId: req.user.userId,
-            accountType: mode,
-            symbol,
-            tradeType: tradeType.toUpperCase(), // BUY or SELL
-            volume,
-            openPrice: symbol.includes('XAU') ? 2500.50 : 1.0850, // Mock price engine
-            stopLoss: stopLoss || null,
-            takeProfit: takeProfit || null,
-            openedAt: new Date()
+    authorizeApplication() {
+        console.log(`[cTrader Gateway] Authorizing App Credentials for ${this.environment}...`);
+        const payload = {
+            clientId: CTRADER_CLIENT_ID,
+            clientSecret: CTRADER_CLIENT_SECRET
         };
+        return this.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_APPLICATION_AUTH_REQ, payload);
+    }
 
-        userPositions.push(position);
+    sendPayload(payloadType, msgData, clientMsgId = null) {
+        if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+            throw new Error('cTrader WebSocket connection is not open');
+        }
 
-        res.status(201).json({
-            success: true,
-            message: `Trade executed on ${mode} account via Lesego Markets Engine.`,
-            trade: position
+        const jsonWrapper = JSON.stringify({
+            payloadType: payloadType,
+            payload: msgData,
+            clientMsgId: clientMsgId || `msg_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`
         });
+
+        this.ws.send(jsonWrapper);
+    }
+
+    sendRequest(payloadType, msgData) {
+        return new Promise((resolve, reject) => {
+            const clientMsgId = `req_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+            
+            const timeout = setTimeout(() => {
+                this.pendingRequests.delete(clientMsgId);
+                reject(new Error(`Request timeout for PayloadType: ${payloadType}`));
+            }, 15000);
+
+            this.pendingRequests.set(clientMsgId, { resolve, reject, timeout });
+
+            try {
+                this.sendPayload(payloadType, msgData, clientMsgId);
+            } catch (err) {
+                this.pendingRequests.delete(clientMsgId);
+                clearTimeout(timeout);
+                reject(err);
+            }
+        });
+    }
+
+    handleIncomingMessage(data) {
+        try {
+            const parsed = JSON.parse(data.toString());
+            const { payloadType, payload, clientMsgId } = parsed;
+
+            // Handle Heartbeats
+            if (payloadType === PROTO_PAYLOAD_TYPE.HEARTBEAT_EVENT) return;
+
+            // Forward execution events and market ticks to web clients
+            if (payloadType === PROTO_PAYLOAD_TYPE.PROTO_OA_SPOT_EVENT || payloadType === PROTO_PAYLOAD_TYPE.PROTO_OA_EXECUTION_EVENT) {
+                broadcastToFrontend({ payloadType, payload });
+            }
+
+            // Resolve pending requests
+            if (clientMsgId && this.pendingRequests.has(clientMsgId)) {
+                const { resolve, reject, timeout } = this.pendingRequests.get(clientMsgId);
+                clearTimeout(timeout);
+                this.pendingRequests.delete(clientMsgId);
+
+                if (payloadType === PROTO_PAYLOAD_TYPE.PROTO_OA_ERROR_RES) {
+                    reject(new Error(payload.description || 'cTrader API Returned Error'));
+                } else {
+                    resolve(payload);
+                }
+            }
+        } catch (err) {
+            console.error('[cTrader Gateway] Failed to parse WebSocket frame:', err.message);
+        }
+    }
+}
+
+// Initialize Connection Pool
+socketPool.DEMO = new CTraderConnectionManager('DEMO');
+socketPool.LIVE = new CTraderConnectionManager('LIVE');
+
+Promise.all([
+    socketPool.DEMO.connect().catch(e => console.error("DEMO Init Error:", e.message)),
+    socketPool.LIVE.connect().catch(e => console.error("LIVE Init Error:", e.message))
+]);
+
+// ==========================================
+// 4. FRONTEND WEBSOCKET BROADCASTING
+// ==========================================
+function broadcastToFrontend(message) {
+    const jsonStr = JSON.stringify(message);
+    wssFrontend.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            client.send(jsonStr);
+        }
+    });
+}
+
+wssFrontend.on('connection', (ws) => {
+    console.log('[Frontend WS] New Web Client Connected to Live Stream.');
+    ws.send(JSON.stringify({ status: 'CONNECTED', message: 'Lesego Markets Realtime Gateway Active' }));
+});
+
+// ==========================================
+// 5. REST API ROUTES (OAUTH & TRADING)
+// ==========================================
+
+// Health Check Endpoint (Required for Render Deployment)
+app.get('/health', (req, res) => {
+    res.status(200).json({
+        status: 'HEALTHY',
+        service: 'Lesego Markets cTrader Server',
+        demoSocket: socketPool.DEMO.isAuthorized ? 'CONNECTED' : 'DISCONNECTED',
+        liveSocket: socketPool.LIVE.isAuthorized ? 'CONNECTED' : 'DISCONNECTED',
+        timestamp: new Date()
+    });
+});
+
+app.get('/', (req, res) => {
+    res.status(200).send('Lesego Markets cTrader Open API Backend Engine Active.');
+});
+
+// ------------------------------------------
+// AUTHENTICATION (cTID OAuth 2.0 Integration)
+// ------------------------------------------
+
+// Fetch cTrader OAuth Direct Authorization URL
+app.get('/api/auth/login-url', (req, res) => {
+    const authUrl = `https://openapi.ctrader.com/apps/auth?client_id=${CTRADER_CLIENT_ID}&redirect_uri=${encodeURIComponent(CTRADER_REDIRECT_URI)}&scope=trading`;
+    res.json({ success: true, authUrl });
+});
+
+// Exchange Authorization Code for cTrader Tokens
+app.post('/api/auth/token', async (req, res) => {
+    const { code } = req.body;
+    if (!code) {
+        return res.status(400).json({ success: false, message: 'Authorization code is required' });
+    }
+
+    try {
+        const response = await axios.get('https://openapi.ctrader.com/apps/token', {
+            params: {
+                grant_type: 'authorization_code',
+                code: code,
+                client_id: CTRADER_CLIENT_ID,
+                client_secret: CTRADER_CLIENT_SECRET,
+                redirect_uri: CTRADER_REDIRECT_URI
+            }
+        });
+
+        const tokenData = response.data; // access_token, refresh_token, accessTokenExpirations
+        res.json({ success: true, auth: tokenData });
+    } catch (error) {
+        console.error('[OAuth Token Error]:', error.response?.data || error.message);
+        res.status(500).json({
+            success: false,
+            message: 'cTrader Authentication Failed',
+            error: error.response?.data || error.message
+        });
+    }
+});
+
+// Refresh Expired cTrader Token
+app.post('/api/auth/refresh', async (req, res) => {
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(400).json({ success: false, message: 'Refresh token required' });
+
+    try {
+        const response = await axios.get('https://openapi.ctrader.com/apps/token', {
+            params: {
+                grant_type: 'refresh_token',
+                refresh_token: refreshToken,
+                client_id: CTRADER_CLIENT_ID,
+                client_secret: CTRADER_CLIENT_SECRET
+            }
+        });
+        res.json({ success: true, auth: response.data });
+    } catch (error) {
+        res.status(500).json({ success: false, error: error.response?.data || error.message });
+    }
+});
+
+// ------------------------------------------
+// ACCOUNTS MANAGEMENT
+// ------------------------------------------
+
+// Fetch all trading accounts associated with access token
+app.post('/api/accounts/list', async (req, res) => {
+    const { accessToken, environment = 'DEMO' } = req.body;
+    if (!accessToken) return res.status(400).json({ success: false, message: 'Access token required' });
+
+    const manager = socketPool[environment.toUpperCase()];
+    if (!manager || !manager.isAuthorized) {
+        return res.status(503).json({ success: false, message: 'cTrader Gateway connection unavailable' });
+    }
+
+    try {
+        const result = await manager.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_GET_ACCOUNTS_BY_ACCESS_TOKEN_REQ, {
+            accessToken: accessToken
+        });
+        res.json({ success: true, accounts: result.ctaTraderAccount });
     } catch (error) {
         res.status(500).json({ success: false, message: error.message });
     }
 });
 
-// Get Active Trades
-app.get('/api/trade/positions', authenticateToken, (req, res) => {
-    const { accountType } = req.query;
-    const mode = (accountType || 'DEMO').toUpperCase();
-
-    const activeTrades = userPositions.filter(
-        p => p.userId === req.user.userId && p.accountType === mode
-    );
-
-    res.json({ success: true, accountType: mode, positions: activeTrades });
-});
-
-// Close Trade
-app.post('/api/trade/close', authenticateToken, (req, res) => {
-    const { tradeId } = req.body;
-    const index = userPositions.findIndex(p => p.tradeId === tradeId && p.userId === req.user.userId);
-
-    if (index === -1) {
-        return res.status(404).json({ success: false, message: 'Position not found.' });
+// Authorize Account for Trading Session
+app.post('/api/accounts/authenticate', async (req, res) => {
+    const { accessToken, cTraderAccountId, environment = 'DEMO' } = req.body;
+    if (!accessToken || !cTraderAccountId) {
+        return res.status(400).json({ success: false, message: 'Access Token and Account ID required' });
     }
 
-    const closedTrade = userPositions.splice(index, 1)[0];
-    res.json({ success: true, message: 'Trade closed successfully.', closedTrade });
+    const manager = socketPool[environment.toUpperCase()];
+    try {
+        const result = await manager.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_ACCOUNT_AUTH_REQ, {
+            accessToken: accessToken,
+            ctraderAccountId: parseInt(cTraderAccountId)
+        });
+        res.json({ success: true, message: 'Account Authorized Successfully', details: result });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
 });
 
-// --- Server Listener for Render Deployment ---
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Lesego Markets API Engine running on port ${PORT}`);
+// Get Detailed Balance / Margin / Equity Info
+app.get('/api/accounts/trader-info', async (req, res) => {
+    const { cTraderAccountId, environment = 'DEMO' } = req.query;
+    if (!cTraderAccountId) return res.status(400).json({ success: false, message: 'cTraderAccountId is required' });
+
+    const manager = socketPool[environment.toUpperCase()];
+    try {
+        const result = await manager.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_TRADER_REQ, {
+            ctraderAccountId: parseInt(cTraderAccountId)
+        });
+        res.json({ success: true, trader: result.trader });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ------------------------------------------
+// TRADING & ORDER MANAGEMENT
+// ------------------------------------------
+
+// Place Market / Limit Order
+app.post('/api/trade/order', async (req, res) => {
+    const {
+        cTraderAccountId,
+        symbolId,
+        tradeSide, // "BUY" or "SELL"
+        volume, // In Cents/Units (e.g., 100000 = 1 Lot)
+        orderType = "MARKET", // "MARKET", "LIMIT", "STOP"
+        limitPrice = null,
+        stopLoss = null,
+        takeProfit = null,
+        environment = 'DEMO'
+    } = req.body;
+
+    if (!cTraderAccountId || !symbolId || !tradeSide || !volume) {
+        return res.status(400).json({ success: false, message: 'Missing order parameters' });
+    }
+
+    const manager = socketPool[environment.toUpperCase()];
+
+    const payload = {
+        ctraderAccountId: parseInt(cTraderAccountId),
+        symbolId: parseInt(symbolId),
+        orderType: orderType,
+        tradeSide: tradeSide.toUpperCase(),
+        volume: parseInt(volume),
+        stopLoss: stopLoss ? parseFloat(stopLoss) : undefined,
+        takeProfit: takeProfit ? parseFloat(takeProfit) : undefined
+    };
+
+    if (orderType === "LIMIT" && limitPrice) {
+        payload.limitPrice = parseFloat(limitPrice);
+    }
+
+    try {
+        const result = await manager.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_NEW_ORDER_REQ, payload);
+        res.json({ success: true, message: 'Order Executed', result });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Close Active Position
+app.post('/api/trade/close', async (req, res) => {
+    const { cTraderAccountId, positionId, volume, environment = 'DEMO' } = req.body;
+    if (!cTraderAccountId || !positionId || !volume) {
+        return res.status(400).json({ success: false, message: 'AccountId, PositionId, and Volume required' });
+    }
+
+    const manager = socketPool[environment.toUpperCase()];
+    try {
+        const result = await manager.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_CLOSE_POSITION_REQ, {
+            ctraderAccountId: parseInt(cTraderAccountId),
+            positionId: parseInt(positionId),
+            volume: parseInt(volume)
+        });
+        res.json({ success: true, message: 'Position Closed', result });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Get Active Open Positions and Orders
+app.get('/api/trade/positions', async (req, res) => {
+    const { cTraderAccountId, environment = 'DEMO' } = req.query;
+    if (!cTraderAccountId) return res.status(400).json({ success: false, message: 'cTraderAccountId is required' });
+
+    const manager = socketPool[environment.toUpperCase()];
+    try {
+        const result = await manager.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_RECONCILE_REQ, {
+            ctraderAccountId: parseInt(cTraderAccountId)
+        });
+        res.json({ success: true, positions: result.position, orders: result.order });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ------------------------------------------
+// MARKET DATA & SYMBOLS
+// ------------------------------------------
+
+// Get Available Symbols
+app.get('/api/market/symbols', async (req, res) => {
+    const { cTraderAccountId, environment = 'DEMO' } = req.query;
+    if (!cTraderAccountId) return res.status(400).json({ success: false, message: 'cTraderAccountId required' });
+
+    const manager = socketPool[environment.toUpperCase()];
+    try {
+        const result = await manager.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_SYMBOLS_LIST_REQ, {
+            ctraderAccountId: parseInt(cTraderAccountId)
+        });
+        res.json({ success: true, symbols: result.symbol });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// Subscribe to Realtime Symbol Prices (Ticks)
+app.post('/api/market/subscribe', async (req, res) => {
+    const { cTraderAccountId, symbolIds, environment = 'DEMO' } = req.body; // Array of symbol IDs
+    if (!cTraderAccountId || !symbolIds) {
+        return res.status(400).json({ success: false, message: 'AccountId and SymbolIds required' });
+    }
+
+    const manager = socketPool[environment.toUpperCase()];
+    try {
+        const result = await manager.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_SUBSCRIBE_SPOTS_REQ, {
+            ctraderAccountId: parseInt(cTraderAccountId),
+            symbolId: Array.isArray(symbolIds) ? symbolIds.map(i => parseInt(i)) : [parseInt(symbolIds)]
+        });
+        res.json({ success: true, message: 'Subscribed to Market Ticks', result });
+    } catch (error) {
+        res.status(500).json({ success: false, message: error.message });
+    }
+});
+
+// ------------------------------------------
+// DEPOSIT & WITHDRAWAL GATEWAYS
+// ------------------------------------------
+
+// Deposit Funds Request
+app.post('/api/wallet/deposit', async (req, res) => {
+    const { cTraderAccountId, amount, environment = 'DEMO' } = req.body;
+    if (!cTraderAccountId || !amount) {
+        return res.status(400).json({ success: false, message: 'AccountId and Amount required' });
+    }
+
+    const manager = socketPool[environment.toUpperCase()];
+    try {
+        // Forward margin deposit request to cTrader API if permitted
+        const result = await manager.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_DEPOSIT_MARGIN_REQ, {
+            ctraderAccountId: parseInt(cTraderAccountId),
+            moneyDigits: 2,
+            delta: parseInt(amount * 100)
+        });
+        res.json({ success: true, message: 'Deposit Processed', result });
+    } catch (error) {
+        // Return standard feedback if broker handles deposits externally
+        res.json({ 
+            success: false, 
+            message: 'Direct API deposit depends on broker privileges. Redirecting to payment portal...',
+            error: error.message 
+        });
+    }
+});
+
+// Withdraw Funds Request
+app.post('/api/wallet/withdraw', async (req, res) => {
+    const { cTraderAccountId, amount, environment = 'DEMO' } = req.body;
+    if (!cTraderAccountId || !amount) {
+        return res.status(400).json({ success: false, message: 'AccountId and Amount required' });
+    }
+
+    const manager = socketPool[environment.toUpperCase()];
+    try {
+        const result = await manager.sendRequest(PROTO_PAYLOAD_TYPE.PROTO_OA_WITHDRAW_MARGIN_REQ, {
+            ctraderAccountId: parseInt(cTraderAccountId),
+            moneyDigits: 2,
+            delta: parseInt(amount * 100)
+        });
+        res.json({ success: true, message: 'Withdrawal Executed', result });
+    } catch (error) {
+        res.json({ 
+            success: false, 
+            message: 'Withdrawal requested. Awaiting broker approval.',
+            error: error.message 
+        });
+    }
+});
+
+// ==========================================
+// 6. SERVER BINDING (RENDER READY)
+// ==========================================
+server.listen(PORT, '0.0.0.0', () => {
+    console.log(`====================================================`);
+    console.log(` Lesego Markets cTrader API Server Active          `);
+    console.log(` Port: ${PORT}                                      `);
+    console.log(` Bind Address: 0.0.0.0                             `);
+    console.log(`====================================================`);
 });
