@@ -27,17 +27,17 @@ process.on('uncaughtException', (err) => {
 });
 
 // ============================================================================
-// SECTION 2: SYSTEM CONFIGURATION & ENVIRONMENT VARIABLES
+// SECTION 2: ENVIRONMENT & API CONFIGURATION
 // ============================================================================
-
 const PORT = process.env.PORT || 10000;
 const CTRADER_CLIENT_ID = process.env.CTRADER_CLIENT_ID || "38384_wh6ecCD5h0tHjsNXc57f7a0f2aZeKUubeFlpkKDMpQqHn58H0m";
 const CTRADER_CLIENT_SECRET = process.env.CTRADER_CLIENT_SECRET || "jkcXDForVeNulNasjMa1vnQKtZwbrOLjgH4GDLL3dkVWZVC0V4";
 const CTRADER_REDIRECT_URI = process.env.CTRADER_REDIRECT_URI || "https://lesego.onrender.com";
 
+// Use Port 5036 for WebSocket (wss://) connections, or 5035 for direct TCP sockets
 const CTRADER_SERVERS = {
-    DEMO: { host: 'demo.ctraderapi.com', port: 5035 },
-    LIVE: { host: 'live.ctraderapi.com', port: 5035 }
+    DEMO: { host: 'demo.ctraderapi.com', port: 5036 },
+    LIVE: { host: 'live.ctraderapi.com', port: 5036 }
 };
 
 // ============================================================================

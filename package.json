@@ -1,13 +1,13 @@
 {
   "name": "lesego-markets-ctrader-backend",
-  "version": "3.5.1",
+  "version": "3.5.2",
   "description": "Lesego Markets cTrader Open API Production Engine",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
   },
   "dependencies": {
-    "@spotware/open-api-sdk": "git+https://github.com/spotware/open-api-sdk-js.git",
+    "@spotware/open-api-sdk": "https://codeload.github.com/spotware/open-api-sdk-js/tar.gz/refs/heads/master",
     "axios": "^1.6.8",
     "cors": "^2.8.5",
     "dotenv": "^16.4.5",
