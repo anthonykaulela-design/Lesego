@@ -1,7 +1,7 @@
 {
-  "name": "lesego-markets-ctrader-backend",
-  "version": "2.1.0",
-  "description": "Lesego Markets cTrader Open API Production Engine",
+  "name": "lesego-markets-backend",
+  "version": "3.0.0",
+  "description": "Lesego Markets cTrader Open API Gateway",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
