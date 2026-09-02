@@ -1,6 +1,6 @@
 /**
  * ============================================================================
- * LESEGO MARKETS - cTrader Open API Full Market & Binary Bridge Engine
+ * LESEGO MARKETS - Stabilized cTrader Open API Engine
  * ============================================================================
  */
 
@@ -53,33 +53,62 @@ class CTraderGatewayEngine {
         this.socket = null;
         this.isAuthorized = false;
         this.isConnecting = false;
+        this.retryTimer = null;
     }
 
     connect() {
-        if (this.isConnecting) return;
+        if (this.isConnecting || this.socket) return;
         this.isConnecting = true;
 
+        if (this.socket) {
+            this.socket.destroy();
+            this.socket = null;
+        }
+
         try {
-            this.socket = tls.connect(this.serverConfig.port, this.serverConfig.host, { rejectUnauthorized: true }, () => {
+            console.log(`[cTrader Gateway] Initializing ${this.environment} TLS Socket to ${this.serverConfig.host}:${this.serverConfig.port}...`);
+            
+            this.socket = tls.connect({
+                host: this.serverConfig.host,
+                port: this.serverConfig.port,
+                rejectUnauthorized: true
+            }, () => {
                 this.isConnecting = false;
                 this.isAuthorized = true;
+                console.log(`[cTrader Gateway] Connected successfully to ${this.environment} feed.`);
                 this.streamAllCTraderMarkets();
             });
 
-            this.socket.on('error', () => { this.isConnecting = false; });
+            this.socket.on('error', (err) => {
+                this.isConnecting = false;
+                console.log(`[cTrader Gateway] ${this.environment} Socket Error:`, err.message);
+                this.cleanupAndRetry();
+            });
+
             this.socket.on('close', () => {
                 this.isAuthorized = false;
                 this.isConnecting = false;
-                setTimeout(() => this.connect(), 5000);
+                console.log(`[cTrader Gateway] Connection Terminated on ${this.environment}. Resetting...`);
+                this.cleanupAndRetry();
             });
         } catch (err) {
             this.isConnecting = false;
-            setTimeout(() => this.connect(), 5000);
+            console.log(`[cTrader Gateway] Exception caught:`, err.message);
+            this.cleanupAndRetry();
         }
     }
 
+    cleanupAndRetry() {
+        if (this.socket) {
+            this.socket.removeAllListeners();
+            this.socket.destroy();
+            this.socket = null;
+        }
+        if (this.retryTimer) clearTimeout(this.retryTimer);
+        this.retryTimer = setTimeout(() => this.connect(), 10000); // Back off to 10s to clear states
+    }
+
     streamAllCTraderMarkets() {
-        // Comprehensive list of all major, minor, exotic forex pairs, crypto, and indices offered by cTrader brokers
         const allSymbols = [
             { symbol: 'EURUSD', base: 1.08450, spread: 0.00012, step: 0.0004 },
             { symbol: 'GBPUSD', base: 1.29310, spread: 0.00015, step: 0.0005 },
@@ -100,16 +129,17 @@ class CTraderGatewayEngine {
             { symbol: 'GER40', base: 18450.0, spread: 1.5, step: 22.0 }
         ];
 
-        // Send full market inventory immediately on connection socket establishment
         broadcastToFrontend({ type: 'MARKET_LIST', markets: allSymbols });
 
-        // Stream real-time moving candlestick and tick changes every second
-        setInterval(() => {
-            if (!this.isAuthorized) return;
+        const tickInterval = setInterval(() => {
+            if (!this.isAuthorized) {
+                clearInterval(tickInterval);
+                return;
+            }
             
             allSymbols.forEach(item => {
                 item.base += (Math.random() - 0.49) * item.step;
-                const bid = item.base.toFixed(item.symbol.includes('JPY') || item.symbol.includes('USD') && item.symbol.length > 5 ? 2 : (item.symbol.includes('USD') && item.base > 1000 ? 1 : 5));
+                const bid = item.base.toFixed(item.symbol.includes('JPY') || (item.symbol.includes('USD') && item.symbol.length > 5) ? 2 : (item.symbol.includes('USD') && item.base > 1000 ? 1 : 5));
                 const ask = (parseFloat(bid) + item.spread).toFixed(bid.includes('.') && bid.split('.')[1].length || 5);
                 
                 broadcastToFrontend({
@@ -128,7 +158,7 @@ const gateway = new CTraderGatewayEngine('DEMO');
 gateway.connect();
 
 app.get('/health', (req, res) => {
-    res.status(200).json({ status: 'HEALTHY', engine: 'Lesedi Markets Full cTrader Engine' });
+    res.status(200).json({ status: 'HEALTHY', engine: 'Lesedi Markets Stabilized Engine' });
 });
 
 app.get('/api/auth/login-url', (req, res) => {
